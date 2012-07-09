@@ -47,7 +47,7 @@ for filter in KQ_NOTE_MAP:
         d[num] = note
     KQ_NOTE_MAP[filter] = d
 
-def pprint_kevent(kevent):
+def pformat_kevent(kevent):
     pretty_filter = KQ_FILTERS.get(kevent.filter, '?')
     pretty_flags = []
     for value in KQ_EVS:
@@ -78,7 +78,7 @@ class KQ(object):
         fd = fileobject.fileno()
         self.io_objects[fd] = fileobject
         ke = select.kevent(fd, filter_, select.KQ_EV_ADD)
-        #print "The event we're sending:", pprint_kevent(ke)
+        #print "The event we're sending:", pformat_kevent(ke)
         self.kq.control([ke], 0)
         self.active_kevents[fd][filter_] = ke
 
@@ -89,9 +89,9 @@ class KQ(object):
         except TypeError:
             fileobject = fileobject_or_fd
             fd = fileobject.fileno()
-        #print "Before unregister, these events were active for this fd: ", [pprint_kevent(self.active_kevents[fd][f]) for f in self.active_kevents[fd]]
+        #print "Before unregister, these events were active for this fd: ", [pformat_kevent(self.active_kevents[fd][f]) for f in self.active_kevents[fd]]
         ke = select.kevent(fd, filter_, select.KQ_EV_DELETE)
-        #print "The event we're sending:", pprint_kevent(ke)
+        #print "The event we're sending:", pformat_kevent(ke)
         self.kq.control([ke], 0)
 
     def poll(self, timeout=None):
@@ -120,6 +120,8 @@ def interactive_test():
                 kq.register(foo, filter_)
             else:
                 print 'polling...'
+        elif 'read' in r:
+            print 'reading from foo:', foo.read(10)
         else:
             print 'polling...'
 
@@ -127,7 +129,7 @@ def interactive_test():
         if not events:
             print 'poll timed out!'
         for event in events:
-            print pprint_kevent(event)
+            print pformat_kevent(event)
             if event.filter == select.KQ_FILTER_WRITE:
                 print "fd", event.ident, "Ready to be written to!"
             elif event.filter == select.KQ_FILTER_READ:
