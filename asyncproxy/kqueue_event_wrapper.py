@@ -32,12 +32,7 @@ KQ_NOTE_MAP = {
 		'KQ_NOTE_TRACKERR',
 	],
 }
-#	'KQ_FILTER_NETDEV' : [
-#		'KQ_NOTE_LINKUP',
-#		'KQ_NOTE_LINKDOWN',
-#		'KQ_NOTE_LINKINV',
-#	],
-#}
+
 for filter in KQ_NOTE_MAP:
 	d = {}
 	for note in KQ_NOTE_MAP[filter]:
