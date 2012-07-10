@@ -71,11 +71,16 @@ class KQ(object):
 
     def reg_read(self, fileobject): self.register(fileobject, select.KQ_FILTER_READ)
     def reg_write(self, fileobject): self.register(fileobject, select.KQ_FILTER_WRITE)
-    def unreg_read(self, fileobject_or_fd): self.register(fileobject_or_fd, select.KQ_FILTER_READ)
-    def unreg_write(self, fileobject_or_fd): self.register(fileobject_or_fd, select.KQ_FILTER_WRITE)
+    def unreg_read(self, fileobject_or_fd): self.unregister(fileobject_or_fd, select.KQ_FILTER_READ)
+    def unreg_write(self, fileobject_or_fd): self.unregister(fileobject_or_fd, select.KQ_FILTER_WRITE)
 
-    def register(self, fileobject, filter_):
-        fd = fileobject.fileno()
+    def register(self, fileobject_or_fd, filter_):
+        try:
+            fd = int(fileobject_or_fd)
+            fileobject = self.io_objects[fd]
+        except TypeError:
+            fileobject = fileobject_or_fd
+            fd = fileobject.fileno()
         self.io_objects[fd] = fileobject
         ke = select.kevent(fd, filter_, select.KQ_EV_ADD)
         #print "The event we're sending:", pformat_kevent(ke)
