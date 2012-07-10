@@ -61,7 +61,7 @@ class AsyncProxy(object):
             try:
                 del d[fd]
             except KeyError:
-                pass 
+                pass
         return True
 
     def read(self, fd):
@@ -141,7 +141,7 @@ class AsyncProxy(object):
                     return (address, int(port))
         else:
             if self.read_done[fd]:
-                raise Exception("Don't know where to route request: "+"".join(read_buffer))
+                raise Exception("Don't know where to route request from "+str(self.socket[fd].getsockname())+":".join(read_buffer))
             else:
                 return False
 
