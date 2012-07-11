@@ -111,7 +111,6 @@ class ClientConnection(Connection):
                 ServerConnection(self, address, port, self.cxn_map)
 
     def write_event(self):
-        print 'processing client write event...'
         written = super(ClientConnection, self).write_event()
 
     def parse(self):
