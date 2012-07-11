@@ -19,13 +19,154 @@ import socket
 import time
 import re
 
-import cProfile
-
-from collections import defaultdict
-
 import kq
 
+KQ = kq.KQ()
 SOCKET_READ_AMOUNT = 1024
+
+class Connection(object):
+    def __init__(self, socket, cxn_map):
+        self.cxn_map = cxn_map
+        self.socket = socket
+        self.fd = socket.fileno()
+        self.cxn_map[self.fd] = self
+        self.done_reading = False
+        self.read_buffer = []
+
+    def __repr__(self):
+        s = '<'+str(self.__class__.__name__)+(', fd %s' % self.fd)+'>'
+        return s
+
+    def close(self):
+        pass
+
+    def reg_read(self): KQ.reg_read(self.socket)
+    def reg_write(self): KQ.reg_write(self.socket)
+    def unreg_read(self): KQ.unreg_read(self.socket)
+    def unreg_write(self): KQ.unreg_write(self.socket)
+
+    def read_event(self):
+        """Returns number of bytes of data read, or None if closed"""
+        try:
+            #print 'reading from', self.socket
+            data = self.socket.recv(SOCKET_READ_AMOUNT)
+            #print 'read data excerpt:', data[:50]
+        except socket.error as ex:
+            if str(ex) in ["[Errno 35] Resource temporarily unavailable"]:
+                return 0
+            elif str(ex) in ["socket.error: [Errno 54] Connection reset by peer"]:
+                print 'connection reset by peer (dunno what to do yet)'
+                pass
+            else:
+                raise ex
+        if data == '':
+            self.done_reading = True
+            self.unreg_read()
+            return None
+        else:
+            self.read_buffer.append(data)
+            print 'read', len(data), 'bytes on', self
+            return len(data)
+
+    def write_event(self):
+        """Returns the number of bytes written"""
+        buff = self.relay_cxn.read_buffer
+        if buff:
+            l = len(buff[0])
+            try:
+                sent = self.socket.send(buff[0])
+            except socket.error as ex:
+                if str(ex) == "[Errno 35] Resource temporarily unavailable":
+                    # remote buffer full!
+                    return 0
+                else:
+                    raise ex
+            if l == sent:
+                buff.pop(0)
+            else:
+                buff[0] = buff[0][sent:]
+            print 'wrote', sent, 'bytes on', self
+            return sent
+        else:
+            print 'self.relay_cxn.read_buffer empty!'
+            self.unreg_write()
+            return 0
+
+class ClientConnection(Connection):
+    def __init__(self, socket, cxn_map):
+        super(ClientConnection, self).__init__(socket, cxn_map)
+        self.relay_cxn = None
+        KQ.reg_read(self.socket)
+
+    def read_event(self):
+        read = super(ClientConnection, self).read_event()
+        if read is None:
+            self.close()
+        if self.relay_cxn:
+            self.relay_cxn.reg_write()
+        else:
+            r = self.parse()
+            if r:
+                address, port = r
+                ServerConnection(self, address, port, self.cxn_map)
+
+    def write_event(self):
+        print 'processing client write event...'
+        written = super(ClientConnection, self).write_event()
+
+    def parse(self):
+        """Find a request's dest. from a list of string in buffer"""
+        for i in xrange(1,len(self.read_buffer)+1):
+            m = re.search(r'[\r\n]+Host:\s*([^\r\n:]+):(\d+)', "".join(self.read_buffer[:i]))
+            if m:
+                (address, port) = m.groups()
+                return (address, int(port))
+            else:
+                n = re.search(r'[\r\n]+Host:\s*([^\r\n]+)', "".join(self.read_buffer[:i]))
+                if n:
+                    port = 80
+                    [address] = n.groups()
+                    return (address, int(port))
+        else:
+            if self.done_reading:
+                #raise Exception("Don't know where to route request from "+str(self.socket.getsockname())+":".join(self.read_buffer))
+                print 'lost connection we didn\'t know how to parse'
+                self.socket.close()
+            else:
+                return False
+
+class ServerConnection(Connection):
+    def __init__(self, client_cxn, address, port, cxn_map):
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.setblocking(0)
+        super(ServerConnection, self).__init__(s, cxn_map)
+        self.relay_cxn = client_cxn
+        self.relay_cxn.relay_cxn = self
+        try:
+            self.socket.connect((address, port))
+        except socket.error as ex:
+            if str(ex) == "[Errno 36] Operation now in progress":
+                pass
+            else:
+                raise ex
+        self.reg_write()
+        self.reg_read()
+
+    def write_event(self):
+        written = super(ServerConnection, self).write_event()
+
+    def read_event(self):
+        read = super(ServerConnection, self).read_event()
+
+        # Don't worry about it, I imagine servers are allowed to close
+        #if read is None:
+        #    self.close()
+
+        if read:
+            self.relay_cxn.reg_write()
+
+
 class AsyncProxy(object):
     def __init__(self, port=8000, address='localhost'):
         self.address = address
@@ -36,15 +177,7 @@ class AsyncProxy(object):
         self.listensock.bind((address, port))
         self.listensock.listen(5)
         print 'listening on', address, 'at port', port
-        self.kq = kq.KQ()
-
-        self.socket = {}
-        self.read_from_write = {}
-        self.write_from_read = {}
-        self.is_server_conn = {}
-        self.needs_parsing = {}
-        self.read_buffer = defaultdict(list)
-        self.read_done = {}
+        self.cxns = {}
 
     def accept(self):
         try:
@@ -52,164 +185,41 @@ class AsyncProxy(object):
         except socket.error:
             return False
         fd = s.fileno()
-        self.socket[fd] = s
-        self.kq.reg_read(s)
-        self.read_done[fd] = False
-        self.needs_parsing[fd] = True
-        self.is_server_conn[fd] = False
-        for d in [self.read_from_write, self.write_from_read]:
-            try:
-                del d[fd]
-            except KeyError:
-                pass
+        self.cxns[fd] = ClientConnection(s, self.cxns)
         return True
 
-    def read(self, fd):
-        print 'reading!'
-        read_buffer = self.read_buffer[fd]
-        try:
-            #print self.socket
-            #print self.socket[fd]
-            data = self.socket[fd].recv(SOCKET_READ_AMOUNT)
-            print 'read data excerpt:', data[:50]
-            read_buffer.append(data)
-        except socket.error as ex:
-            if str(ex) == "[Errno 35] Resource temporarily unavailable":
-                return False
-            else:
-                raise ex
-        if data == '':
-            self.read_done[fd] = True
-            self.kq.unreg_read(fd)
-            if self.is_server_conn[fd]:
-                self.socket[fd].close()
-        if fd in self.write_from_read:
-            assert self.needs_parsing[fd] == False
-            print 'setting write flag, since we just made a successful read!'
-            self.kq.reg_write(self.write_from_read[fd])
-        else:
-            print 'fd', fd, 'not in self.write_from_read!!!'
-            if self.needs_parsing[fd]:
-                self.try_make_request(fd)
-
-    def write(self, fd):
-        print 'writing!'
-        read_buffer = self.read_buffer[self.read_from_write[fd]]
-        if read_buffer:
-            send_sock = self.socket[fd]
-            print send_sock
-            while True:
-                print 'beginning write loop'
-                l = len(read_buffer[0])
-                try:
-                    sent = send_sock.send(read_buffer[0])
-                    print 'sent', sent, 'bytes of data'
-                except socket.error as ex:
-                    if str(ex) == "[Errno 35] Resource temporarily unavailable":
-                        # remote buffer full!
-                        return False
-                    else:
-                        raise ex
-                if l == sent:
-                    read_buffer.pop(0)
-                else:
-                    read_buffer[0] = read_buffer[sent:]
-                break
-        else:
-            print 'but read buffer empty, so nothing to write! Unregistering event for fd', fd
-            self.kq.unreg_write(fd)
-
-    def parse(self, fd):
-        """Figure out from a list of strings if we find the destination"""
-        read_buffer = self.read_buffer[fd]
-        for i in xrange(1,len(read_buffer)+1):
-            print 'searching for host string in header:'
-            #print "".join(read_buffer[:i])
-            m = re.search(r'[\r\n]+Host:\s*([^\r\n:]+):(\d+)', "".join(read_buffer[:i]))
-            if m:
-                print 'found it!'
-                (address, port) = m.groups()
-                print address, port
-                return (address, int(port))
-            else:
-                n = re.search(r'[\r\n]+Host:\s*([^\r\n]+)', "".join(read_buffer[:i]))
-                if n:
-                    print 'found it!'
-                    port = 80
-                    [address] = n.groups()
-                    print address, port
-                    return (address, int(port))
-        else:
-            if self.read_done[fd]:
-                raise Exception("Don't know where to route request from "+str(self.socket[fd].getsockname())+":".join(read_buffer))
-            else:
-                return False
-
     def shuttle(self):
-        events = self.kq.poll(0)
+        events = KQ.poll(0)
         if not events:
             return False
         event = events[0]
         #print 'got event', kq.pformat_kevent(event)
         if event.filter == select.KQ_FILTER_READ:
-            print 'got read event'
-            self.read(event.ident)
+            #print 'got read event'
+            self.cxns[event.ident].read_event()
         elif event.filter == select.KQ_FILTER_WRITE:
-            print 'got write event'
-            self.write(event.ident)
+            #print 'got write event'
+            self.cxns[event.ident].write_event()
         else:
             raise Exception("Not the filter we were expecting for this event")
-
-    def try_make_request(self, fd):
-        print 'trying to make request corresponding to',fd
-        r = self.parse(fd)
-        if r:
-            print 'parsing, succeeded, making connection!'
-            address, port = r
-
-            self.needs_parsing[fd] = False
-
-            host_sock = socket.socket()
-            host_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            host_sock.setblocking(0)
-            host_fd = host_sock.fileno()
-
-            try:
-                host_sock.connect((address, port))
-            except socket.error as ex:
-                if str(ex) == "[Errno 36] Operation now in progress":
-                    pass
-                else:
-                    raise ex
-
-            self.socket[host_fd] = host_sock
-            self.read_done[host_fd] = False
-            self.is_server_conn[host_fd] = True
-            self.needs_parsing[host_fd] = False
-            #TODO chanage is_server_conn and needs_parsing
-            # to be is_server_conn and has_been_parsed
-            # and just do the logic when we need to check
-            self.kq.reg_write(host_sock)
-            self.kq.reg_read(host_sock)
-
-            self.read_from_write[host_fd] = fd
-            self.write_from_read[host_fd] = fd
-            self.read_from_write[fd] = host_fd
 
     def iter(self):
         self.accept()
         self.shuttle()
 
-    def demo(self):
-        while True:
-            t0 = time.time()
-            self.iter()
-            t1 = time.time()
-            raw_input('---loop took %.4f s---' % (t1-t0))
+    def demoiter(self):
+        t0 = time.time()
+        self.iter()
+        t1 = time.time()
+        raw_input('---loop took %.4f s---' % (t1-t0))
 
     def loop(self):
         while True:
             self.iter()
+
+    def demoloop(self):
+        while True:
+            self.demoiter()
 
 if __name__ == '__main__':
     a = AsyncProxy()
