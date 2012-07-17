@@ -16,7 +16,7 @@ import re
 import kq
 
 KQ = kq.KQ()
-SOCKET_READ_AMOUNT = 1024
+SOCKET_READ_AMOUNT = 1024*1024
 
 class Connection(object):
     """A socket that knows what to do when given a kq read or write event.
@@ -41,8 +41,9 @@ class Connection(object):
         s = '<'+str(self.__class__.__name__)+(', fd %s' % self.fd)+'>'
         return s
 
-    def close(self):
-        print 'should have closed socket'
+    def close(self, reason):
+        print 'closing socket:', self, 'because', reason
+        self.socket.close()
         pass
 
     def reg_read(self): KQ.reg_read(self.socket)
@@ -61,7 +62,6 @@ class Connection(object):
                 return 0
             elif str(ex) in ["socket.error: [Errno 54] Connection reset by peer"]:
                 print 'connection reset by peer (dunno what to do about that)'
-                pass
             else:
                 raise ex
         if data == '':
@@ -70,7 +70,7 @@ class Connection(object):
             return None
         else:
             self.read_buffer.append(data)
-            print 'read', len(data), 'bytes on', self
+            #print 'read', len(data), 'bytes on', self
             return len(data)
 
     def write_event(self):
@@ -90,7 +90,7 @@ class Connection(object):
                 buff.pop(0)
             else:
                 buff[0] = buff[0][sent:]
-            print 'wrote', sent, 'bytes on', self
+            #print 'wrote', sent, 'bytes on', self
             return sent
         else:
             #print 'self.relay_cxn.read_buffer empty!'
@@ -108,13 +108,14 @@ class ClientConnection(Connection):
 
     def __init__(self, socket, cxn_map):
         super(ClientConnection, self).__init__(socket, cxn_map)
+        print 'opening client connection', self
         self.relay_cxn = None
         KQ.reg_read(self.socket)
 
     def read_event(self):
         read = super(ClientConnection, self).read_event()
         if read is None:
-            self.close()
+            self.close('read returned None, browser socket closed')
         if self.relay_cxn:
             self.relay_cxn.reg_write()
         else:
@@ -125,6 +126,10 @@ class ClientConnection(Connection):
 
     def write_event(self):
         written = super(ClientConnection, self).write_event()
+        if written is None:
+            self.close('Client connection closed!')
+        if self.done_reading and not self.read_buffer:
+            self.close('Done spooling to client')
 
     def parse(self):
         """Find a request's dest. from a list of string in buffer"""
@@ -139,15 +144,17 @@ class ClientConnection(Connection):
             if n:
                 port = 80
                 [address] = n.groups()
-                print 'outgoing request parsed:'
-                print (address, port)
+                print 'outgoing request parsed:', address, port
                 return (address, int(port))
         else:
             if self.done_reading:
+                print 'lost connection we didn\'t know how to parse:'
+                f = open('errorlog.txt', 'a')
+                f.write('\n\nCouldn\'t parse connection:\n'+str(self)+'\n'+str(self.socket)+'\n'+s+'\n')
+                f.close()
                 #raise Exception("Don't know where to route request from "+str(self.socket.getsockname())+":".join(self.read_buffer))
-                print 'lost connection we didn\'t know how to parse'
                 print ''.join(self.read_buffer)
-                self.socket.close()
+                self.close('don\'t know how to route request')
             else:
                 return False
 
@@ -165,6 +172,7 @@ class ServerConnection(Connection):
         super(ServerConnection, self).__init__(s, cxn_map)
         self.relay_cxn = client_cxn
         self.relay_cxn.relay_cxn = self
+        print 'opening server connection:', self
         try:
             self.socket.connect((address, port))
         except socket.error as ex:
@@ -181,13 +189,12 @@ class ServerConnection(Connection):
     def read_event(self):
         read = super(ServerConnection, self).read_event()
 
-        # Don't worry about it, I imagine servers are allowed to close
-        #if read is None:
-        #    self.close()
-
         if read:
             self.relay_cxn.reg_write()
 
+        # Don't worry about it, I imagine servers are allowed to close
+        if read is None and not self.read_buffer:
+            self.close('Server connection closed, and nothing else in read_buffer')
 
 class AsyncHTTPProxy(object):
     """Async HTTP proxy"""
