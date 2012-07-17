@@ -1,18 +1,12 @@
 """HTTP Proxy Event Loop with Kqueue"""
 
 
-
-"""Notes on how nonblocking sockets work:
-
-    error on recv when nothing to read
-
-    error on write when write buffer is full
-
-    '' on recv if socket closed on other end
-
-    broken pipe error on write if receiver closes early
-
-
+"""
+Notes on how nonblocking sockets work in Python
+error on recv when nothing to read
+error on write when write buffer is full
+'' on recv if socket closed on other end
+broken pipe error on write if receiver closes early
 """
 import select
 import socket
@@ -25,6 +19,16 @@ KQ = kq.KQ()
 SOCKET_READ_AMOUNT = 1024
 
 class Connection(object):
+    """A socket that knows what to do when given a kq read or write event.
+
+    Contains a socket and a read_buffer where data is stored.
+    On kq_read event, reads data (if any) into read_buffer.
+      If socket.recv returns an empty string (done or closed or something),
+      it unregisters kq_read event.
+    On kq_write event, writes data from corresponding
+      connection's (self.relay_cxn) read_buffer.
+      If that read_buffer is empty, it unregisters kq_read event.
+    """
     def __init__(self, socket, cxn_map):
         self.cxn_map = cxn_map
         self.socket = socket
@@ -38,6 +42,7 @@ class Connection(object):
         return s
 
     def close(self):
+        print 'should have closed socket'
         pass
 
     def reg_read(self): KQ.reg_read(self.socket)
@@ -55,7 +60,7 @@ class Connection(object):
             if str(ex) in ["[Errno 35] Resource temporarily unavailable"]:
                 return 0
             elif str(ex) in ["socket.error: [Errno 54] Connection reset by peer"]:
-                print 'connection reset by peer (dunno what to do yet)'
+                print 'connection reset by peer (dunno what to do about that)'
                 pass
             else:
                 raise ex
@@ -88,11 +93,19 @@ class Connection(object):
             print 'wrote', sent, 'bytes on', self
             return sent
         else:
-            print 'self.relay_cxn.read_buffer empty!'
+            #print 'self.relay_cxn.read_buffer empty!'
             self.unreg_write()
             return 0
 
 class ClientConnection(Connection):
+    """Connection between client browser and the proxy.
+
+    ClientConnection tries to parse out HTTP headers on each read event
+    and create a corresponding ServerConnection (self.relay_cxn) with that parsed information
+    until the parsing successfully happens. It closes connection
+    if read says remote socket is closed.
+    """
+
     def __init__(self, socket, cxn_map):
         super(ClientConnection, self).__init__(socket, cxn_map)
         self.relay_cxn = None
@@ -125,16 +138,25 @@ class ClientConnection(Connection):
                 if n:
                     port = 80
                     [address] = n.groups()
+                    print 'outgoing request parsed:'
+                    print (address, port)
                     return (address, int(port))
         else:
             if self.done_reading:
                 #raise Exception("Don't know where to route request from "+str(self.socket.getsockname())+":".join(self.read_buffer))
                 print 'lost connection we didn\'t know how to parse'
+                print ''.join(self.read_buffer)
                 self.socket.close()
             else:
                 return False
 
 class ServerConnection(Connection):
+    """Connection between proxy and server on the internet.
+
+    ServerConnection always must be passed its corresponding
+    ClientConnection on instantiation. On reading data, it triggers
+    its pair ServerConnection (self.relay_cxn) to register for kq read events.
+    """
     def __init__(self, client_cxn, address, port, cxn_map):
         s = socket.socket()
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -166,7 +188,8 @@ class ServerConnection(Connection):
             self.relay_cxn.reg_write()
 
 
-class AsyncProxy(object):
+class AsyncHTTPProxy(object):
+    """Async HTTP proxy"""
     def __init__(self, port=8000, address='localhost'):
         self.address = address
         self.port = port
@@ -192,12 +215,9 @@ class AsyncProxy(object):
         if not events:
             return False
         event = events[0]
-        #print 'got event', kq.pformat_kevent(event)
         if event.filter == select.KQ_FILTER_READ:
-            #print 'got read event'
             self.cxns[event.ident].read_event()
         elif event.filter == select.KQ_FILTER_WRITE:
-            #print 'got write event'
             self.cxns[event.ident].write_event()
         else:
             raise Exception("Not the filter we were expecting for this event")
@@ -206,20 +226,17 @@ class AsyncProxy(object):
         self.accept()
         self.shuttle()
 
-    def demoiter(self):
-        t0 = time.time()
-        self.iter()
-        t1 = time.time()
-        raw_input('---loop took %.4f s---' % (t1-t0))
-
     def loop(self):
         while True:
             self.iter()
 
     def demoloop(self):
         while True:
-            self.demoiter()
+            t0 = time.time()
+            self.iter()
+            t1 = time.time()
+            raw_input('---loop took %.4f s---' % (t1-t0))
 
 if __name__ == '__main__':
-    a = AsyncProxy()
+    a = AsyncHTTPProxy()
     a.loop()
