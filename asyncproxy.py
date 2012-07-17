@@ -129,18 +129,19 @@ class ClientConnection(Connection):
     def parse(self):
         """Find a request's dest. from a list of string in buffer"""
         for i in xrange(1,len(self.read_buffer)+1):
-            m = re.search(r'[\r\n]+Host:\s*([^\r\n:]+):(\d+)', "".join(self.read_buffer[:i]))
+            s = "".join(self.read_buffer[:i])
+            m = re.search(r'[\r\n]+Host:\s*([^\r\n:]+):(\d+)', s)
             if m:
                 (address, port) = m.groups()
+                print "".join()
                 return (address, int(port))
-            else:
-                n = re.search(r'[\r\n]+Host:\s*([^\r\n]+)', "".join(self.read_buffer[:i]))
-                if n:
-                    port = 80
-                    [address] = n.groups()
-                    print 'outgoing request parsed:'
-                    print (address, port)
-                    return (address, int(port))
+            n = re.search(r'[\r\n]+Host:\s*([^\r\n]+)', s)
+            if n:
+                port = 80
+                [address] = n.groups()
+                print 'outgoing request parsed:'
+                print (address, port)
+                return (address, int(port))
         else:
             if self.done_reading:
                 #raise Exception("Don't know where to route request from "+str(self.socket.getsockname())+":".join(self.read_buffer))
